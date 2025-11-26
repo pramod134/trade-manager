@@ -213,7 +213,7 @@ def run_trade_manager() -> None:
                     continue
 
                 # If managing, close via broker, record close price if possible
-                if status == "nt-managing":
+                if status in ("nt-managing", "pos-managing"):
                     if asset_type == "equity":
                         signal_price = _get_spot_price(spot_under)
                         fill_price = tradier_client.place_equity_market(symbol, qty, "sell")
@@ -272,7 +272,7 @@ def run_trade_manager() -> None:
                 continue
 
             # ---------- STATUS = 'nt-managing' (SL / TP) ----------
-            if status == "nt-managing":
+            if status in ("nt-managing", "pos-managing"):
                 # Check SL first
                 sl_hit, sl_price_signal = check_sl(row, spot_under, spot_option)
                 if sl_hit and sl_price_signal is not None:
