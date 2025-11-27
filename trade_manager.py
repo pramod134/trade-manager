@@ -24,34 +24,38 @@ def _get_tf_close(spot_row: Optional[Dict[str, Any]], tf: Optional[str]) -> Opti
     return tf_row.get("close")
 
 
-def _get_entry_price(row: Dict[str, Any],
-                     spot_under: Optional[Dict[str, Any]],
-                     spot_option: Optional[Dict[str, Any]]) -> Optional[float]:
+# PATCH: helper to choose which instrument (equity vs option) to use for
+# entry / SL / TP based on *_type fields (entry_type, sl_type, tp_type),
+# not asset_type.
+def _choose_spot_row(
+    row: Dict[str, Any],
+    type_field: str,
+    spot_under: Optional[Dict[str, Any]],
+    spot_option: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
     """
-    Returns entry price based on the price_type:
-      - last: spot last price
-      - tf:   time-frame close
+    Selects which instrument's spot row to use for price logic.
+
+    type_field: 'equity' or 'option' (from entry_type / sl_type / tp_type).
+    Falls back to underlying (equity) if missing/unknown.
     """
-    price_type = (row.get("entry_price_type") or "").lower()
-    tf = row.get("entry_tf")
+    t = (type_field or "").lower()
 
-    if row.get("asset_type") == "equity":
-        if price_type == "tf":
-            return _get_tf_close(spot_under, tf)
-        return _get_spot_price(spot_under)
+    if t == "equity":
+        return spot_under
+    if t == "option":
+        return spot_option
 
-    # options
-    if price_type == "tf":
-        return _get_tf_close(spot_option, tf)
-    return _get_spot_price(spot_option)
+    # Fallback: default to underlying
+    return spot_under
 
 
 def _get_sl_level(row: Dict[str, Any]) -> Optional[float]:
-    return row.get("sl")
+    return row.get("sl_level") or row.get("sl")  # support both names just in case
 
 
 def _get_tp_level(row: Dict[str, Any]) -> Optional[float]:
-    return row.get("tp")
+    return row.get("tp_level") or row.get("tp")  # support both names just in case
 
 
 def _now_iso() -> str:
@@ -60,6 +64,8 @@ def _now_iso() -> str:
 
 # ---------- ENTRY / SL / TP CHECKS ----------
 
+# PATCH: entry now respects entry_type, and always returns the price used for
+# decision (so logs can show entry_price even when should_enter=False).
 def check_entry(
     row: Dict[str, Any],
     spot_under: Optional[Dict[str, Any]],
@@ -70,13 +76,13 @@ def check_entry(
 
     entry_cond:
       - 'now' -> use spot price of entry_type instrument
-      - 'ca'  -> candle close ABOVE entry_level (for the entry_type instrument)
-      - 'cb'  -> candle close BELOW entry_level (for the entry_type instrument)
+      - 'ca'  -> TF candle close ABOVE entry_level (for the entry_type instrument)
+      - 'cb'  -> TF candle close BELOW entry_level (for the entry_type instrument)
     """
 
-    cond = row.get("entry_cond")
+    cond = (row.get("entry_cond") or "").lower()
     level = row.get("entry_level")
-    entry_type = row.get("entry_type") or "equity"
+    entry_type = (row.get("entry_type") or "equity").lower()
     entry_tf = row.get("entry_tf")
 
     # Pick which instrument we’re using for entry (equity vs option)
@@ -90,6 +96,7 @@ def check_entry(
         # If we have a price, we always return it for logging, even if we don't enter
         if price is None:
             return False, None
+        # "now" is unconditional: if manage='Y' and status='nt-waiting', this fires immediately
         return True, price
 
     # -------- CA / CB: candle-based entry on TF close --------
@@ -102,6 +109,8 @@ def check_entry(
         # Always return the price used for the decision (if any), so logs can see it
         if price is None or level is None:
             return False, price
+
+        is_long = row.get("side") == "long"
 
         # ca = close ABOVE the level
         if cond == "ca":
@@ -117,15 +126,22 @@ def check_entry(
     return False, None
 
 
-
-def check_sl(row: Dict[str, Any],
-             spot_under: Optional[Dict[str, Any]],
-             spot_option: Optional[Dict[str, Any]]) -> Tuple[bool, Optional[float]]:
+# PATCH: SL now explicitly uses sl_type (equity/option) via _choose_spot_row,
+# not asset_type, and returns the price used (for better logging).
+def check_sl(
+    row: Dict[str, Any],
+    spot_under: Optional[Dict[str, Any]],
+    spot_option: Optional[Dict[str, Any]],
+) -> Tuple[bool, Optional[float]]:
     """
     Returns (sl_hit, price_used)
+
+    sl_cond:
+      - 'at' -> price crosses / touches the SL level
     """
+
     enabled = row.get("sl_enabled")
-    if not enabled:
+    if enabled is False:
         return False, None
 
     cond = (row.get("sl_cond") or "").lower()
@@ -133,46 +149,54 @@ def check_sl(row: Dict[str, Any],
         return False, None
 
     is_long = row.get("side") == "long"
-    price_type = (row.get("sl_price_type") or "").lower()
+    sl_type = (row.get("sl_type") or "equity").lower()
+    price_type = (row.get("sl_price_type") or "last").lower()
     tf = row.get("sl_tf")
     level = _get_sl_level(row)
     if level is None:
         return False, None
 
-    # Determine which price to use
-    if row.get("asset_type") == "equity":
-        if price_type == "tf":
-            price = _get_tf_close(spot_under, tf)
-        else:
-            price = _get_spot_price(spot_under)
+    # Determine which spot row to use (equity vs option)
+    spot_row = _choose_spot_row(row, sl_type, spot_under, spot_option)
+    if not spot_row:
+        return False, None
+
+    # Determine which price to use (last vs TF close)
+    if price_type == "tf":
+        price = _get_tf_close(spot_row, tf)
     else:
-        if price_type == "tf":
-            price = _get_tf_close(spot_option, tf)
-        else:
-            price = _get_spot_price(spot_option)
+        price = _get_spot_price(spot_row)
 
     if price is None:
         return False, None
 
-    # Condition: tick-based SL
+    # Condition: simple level-based SL
     if cond == "at":
         if is_long and price <= level:
             return True, price
         if (not is_long) and price >= level:
             return True, price
-        return False, None
+        return False, price
 
-    return False, None
+    return False, price
 
 
-def check_tp(row: Dict[str, Any],
-             spot_under: Optional[Dict[str, Any]],
-             spot_option: Optional[Dict[str, Any]]) -> Tuple[bool, Optional[float]]:
+# PATCH: TP now explicitly uses tp_type (equity/option) via _choose_spot_row,
+# not asset_type, and returns the price used (for better logging).
+def check_tp(
+    row: Dict[str, Any],
+    spot_under: Optional[Dict[str, Any]],
+    spot_option: Optional[Dict[str, Any]],
+) -> Tuple[bool, Optional[float]]:
     """
     Returns (tp_hit, price_used)
+
+    tp_cond:
+      - 'at' -> price crosses / touches the TP level
     """
+
     enabled = row.get("tp_enabled")
-    if not enabled:
+    if enabled is False:
         return False, None
 
     cond = (row.get("tp_cond") or "").lower()
@@ -180,36 +204,36 @@ def check_tp(row: Dict[str, Any],
         return False, None
 
     is_long = row.get("side") == "long"
-    price_type = (row.get("tp_price_type") or "").lower()
+    tp_type = (row.get("tp_type") or "equity").lower()
+    price_type = (row.get("tp_price_type") or "last").lower()
     tf = row.get("tp_tf")
     level = _get_tp_level(row)
     if level is None:
         return False, None
 
-    # Determine which price to use
-    if row.get("asset_type") == "equity":
-        if price_type == "tf":
-            price = _get_tf_close(spot_under, tf)
-        else:
-            price = _get_spot_price(spot_under)
+    # Determine which spot row to use (equity vs option)
+    spot_row = _choose_spot_row(row, tp_type, spot_under, spot_option)
+    if not spot_row:
+        return False, None
+
+    # Determine which price to use (last vs TF close)
+    if price_type == "tf":
+        price = _get_tf_close(spot_row, tf)
     else:
-        if price_type == "tf":
-            price = _get_tf_close(spot_option, tf)
-        else:
-            price = _get_spot_price(spot_option)
+        price = _get_spot_price(spot_row)
 
     if price is None:
         return False, None
 
-    # Condition: tick-based TP
+    # Condition: simple level-based TP
     if cond == "at":
         if is_long and price >= level:
             return True, price
         if (not is_long) and price <= level:
             return True, price
-        return False, None
+        return False, price
 
-    return False, None
+    return False, price
 
 
 # ---------- MAIN LOOP ----------
@@ -233,6 +257,9 @@ def run_trade_manager() -> None:
             symbol = row.get("symbol")
             occ = row.get("occ")
             asset_type = (row.get("asset_type") or "").lower()
+            entry_type = (row.get("entry_type") or "").lower()
+            sl_type = (row.get("sl_type") or "").lower()
+            tp_type = (row.get("tp_type") or "").lower()
             qty = int(row.get("qty") or 0)
 
             log(
@@ -244,6 +271,9 @@ def run_trade_manager() -> None:
                 manage=manage,
                 status=status,
                 asset_type=asset_type,
+                entry_type=entry_type,
+                sl_type=sl_type,
+                tp_type=tp_type,
                 qty=qty,
             )
 
@@ -345,7 +375,7 @@ def run_trade_manager() -> None:
                         signal_price=signal_price,
                     )
 
-                    # Only treat as closed if we have a confirmed fill price
+                    # PATCH: Only treat as closed if we have a confirmed fill price.
                     if fill_price is None:
                         log(
                             "error",
@@ -416,7 +446,7 @@ def run_trade_manager() -> None:
                     price=entry_price,
                 )
 
-                # Place order
+                # Place order (asset_type still controls what we BUY/SELL, which is correct)
                 if asset_type == "equity":
                     log(
                         "debug",
@@ -450,7 +480,7 @@ def run_trade_manager() -> None:
                     fill_price=fill_price,
                 )
 
-                # Only move to managing if we have a confirmed fill
+                # PATCH: Only move to managing if we have a confirmed fill.
                 if fill_price is None:
                     log(
                         "error",
@@ -542,7 +572,7 @@ def run_trade_manager() -> None:
                         fill_price=fill_price,
                     )
 
-                    # Only close if we have a confirmed fill
+                    # PATCH: Only close if we have a confirmed fill.
                     if fill_price is None:
                         log(
                             "error",
@@ -638,7 +668,7 @@ def run_trade_manager() -> None:
                         fill_price=fill_price,
                     )
 
-                    # Only close if we have a confirmed fill
+                    # PATCH: Only close if we have a confirmed fill.
                     if fill_price is None:
                         log(
                             "error",
