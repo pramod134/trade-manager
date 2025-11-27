@@ -136,8 +136,11 @@ def check_sl(
     """
     Returns (sl_hit, price_used)
 
-    sl_cond:
-      - 'at' -> price crosses / touches the SL level
+    sl_cond semantics:
+      - 'at'  -> level-based SL on spot price
+      - 'now' -> immediate SL based on current spot price
+      - 'ca'  -> TF candle close ABOVE level (for sl_type instrument)
+      - 'cb'  -> TF candle close BELOW level (for sl_type instrument)
     """
 
     enabled = row.get("sl_enabled")
@@ -150,35 +153,56 @@ def check_sl(
 
     is_long = row.get("side") == "long"
     sl_type = (row.get("sl_type") or "equity").lower()
-    price_type = (row.get("sl_price_type") or "last").lower()
-    tf = row.get("sl_tf")
+    sl_tf = row.get("sl_tf")
     level = _get_sl_level(row)
     if level is None:
         return False, None
 
-    # Determine which spot row to use (equity vs option)
+    # pick equity vs option based on sl_type
     spot_row = _choose_spot_row(row, sl_type, spot_under, spot_option)
     if not spot_row:
         return False, None
 
-    # Determine which price to use (last vs TF close)
-    if price_type == "tf":
-        price = _get_tf_close(spot_row, tf)
-    else:
+    price: Optional[float] = None
+
+    # ---- price source rules ----
+    if cond in ("at", "now"):
+        # For 'at' and 'now' we ALWAYS use spot last price
         price = _get_spot_price(spot_row)
+    elif cond in ("ca", "cb"):
+        # For ca/cb we use TF candle close
+        if not sl_tf:
+            return False, None
+        price = _get_tf_close(spot_row, sl_tf)
+    else:
+        # unsupported condition
+        return False, None
 
     if price is None:
         return False, None
 
-    # Condition: simple level-based SL
+    # ---- decision logic ----
+
+    if cond == "now":
+        # immediate SL at current price
+        return True, price
+
     if cond == "at":
+        # level-based SL on spot price, side-aware
         if is_long and price <= level:
             return True, price
         if (not is_long) and price >= level:
             return True, price
         return False, price
 
+    if cond == "ca":  # candle close ABOVE level
+        return (price > level), price
+
+    if cond == "cb":  # candle close BELOW level
+        return (price < level), price
+
     return False, price
+
 
 
 # PATCH: TP now explicitly uses tp_type (equity/option) via _choose_spot_row,
@@ -191,47 +215,38 @@ def check_tp(
     """
     Returns (tp_hit, price_used)
 
-    tp_cond:
-      - 'at' -> price crosses / touches the TP level
+    TP is always based on spot (last) price of tp_type instrument.
+    No candle-close logic, no tp_cond required.
+
+    Long:  hit when price >= tp_level
+    Short: hit when price <= tp_level
     """
 
     enabled = row.get("tp_enabled")
     if enabled is False:
         return False, None
 
-    cond = (row.get("tp_cond") or "").lower()
-    if not cond:
-        return False, None
-
-    is_long = row.get("side") == "long"
-    tp_type = (row.get("tp_type") or "equity").lower()
-    price_type = (row.get("tp_price_type") or "last").lower()
-    tf = row.get("tp_tf")
     level = _get_tp_level(row)
     if level is None:
         return False, None
 
-    # Determine which spot row to use (equity vs option)
+    is_long = row.get("side") == "long"
+    tp_type = (row.get("tp_type") or "equity").lower()
+
+    # choose equity vs option for TP
     spot_row = _choose_spot_row(row, tp_type, spot_under, spot_option)
     if not spot_row:
         return False, None
 
-    # Determine which price to use (last vs TF close)
-    if price_type == "tf":
-        price = _get_tf_close(spot_row, tf)
-    else:
-        price = _get_spot_price(spot_row)
-
+    # always use spot last price for TP
+    price = _get_spot_price(spot_row)
     if price is None:
         return False, None
 
-    # Condition: simple level-based TP
-    if cond == "at":
-        if is_long and price >= level:
-            return True, price
-        if (not is_long) and price <= level:
-            return True, price
-        return False, price
+    if is_long and price >= level:
+        return True, price
+    if (not is_long) and price <= level:
+        return True, price
 
     return False, price
 
