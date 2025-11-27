@@ -128,6 +128,7 @@ def check_entry(
 
 # PATCH: SL now explicitly uses sl_type (equity/option) via _choose_spot_row,
 # not asset_type, and returns the price used (for better logging).
+
 def check_sl(
     row: Dict[str, Any],
     spot_under: Optional[Dict[str, Any]],
@@ -137,8 +138,8 @@ def check_sl(
     Returns (sl_hit, price_used)
 
     sl_cond semantics:
-      - 'at'  -> level-based SL on spot price
-      - 'now' -> immediate SL based on current spot price
+      - 'at'  -> level-based SL on spot price (direction from cp for options, otherwise side)
+      - 'now' -> immediate SL at current spot price
       - 'ca'  -> TF candle close ABOVE level (for sl_type instrument)
       - 'cb'  -> TF candle close BELOW level (for sl_type instrument)
     """
@@ -151,14 +152,18 @@ def check_sl(
     if not cond:
         return False, None
 
-    is_long = row.get("side") == "long"
     sl_type = (row.get("sl_type") or "equity").lower()
     sl_tf = row.get("sl_tf")
     level = _get_sl_level(row)
-    if level is None:
+    asset_type = (row.get("asset_type") or "").lower()
+    cp = (row.get("cp") or "").lower()
+    side = (row.get("side") or "").lower()
+
+    # no level needed for 'now'
+    if cond != "now" and level is None:
         return False, None
 
-    # pick equity vs option based on sl_type
+    # which instrument's prices to use (equity vs option)
     spot_row = _choose_spot_row(row, sl_type, spot_under, spot_option)
     if not spot_row:
         return False, None
@@ -167,10 +172,10 @@ def check_sl(
 
     # ---- price source rules ----
     if cond in ("at", "now"):
-        # For 'at' and 'now' we ALWAYS use spot last price
+        # for 'at' and 'now' we ALWAYS use spot last price
         price = _get_spot_price(spot_row)
     elif cond in ("ca", "cb"):
-        # For ca/cb we use TF candle close
+        # for ca/cb we use TF candle close
         if not sl_tf:
             return False, None
         price = _get_tf_close(spot_row, sl_tf)
@@ -181,20 +186,36 @@ def check_sl(
     if price is None:
         return False, None
 
-    # ---- decision logic ----
-
+    # ---- immediate SL ----
     if cond == "now":
-        # immediate SL at current price
+        # close immediately at current price
         return True, price
 
+    # ---- direction logic for 'at' (tick-based SL) ----
     if cond == "at":
-        # level-based SL on spot price, side-aware
-        if is_long and price <= level:
-            return True, price
-        if (not is_long) and price >= level:
-            return True, price
-        return False, price
+        # For options: use cp to infer direction (call vs put)
+        if asset_type == "option":
+            if cp in ("c", "call"):
+                profit_when_up = True
+            elif cp in ("p", "put"):
+                profit_when_up = False
+            else:
+                # unknown cp, fall back to side
+                profit_when_up = (side != "short")
+        else:
+            # non-option: use side, default to long if missing
+            profit_when_up = (side != "short")
 
+        if profit_when_up:
+            # Calls / long: SL when price goes DOWN below level
+            sl_hit = price <= level
+        else:
+            # Puts / short: SL when price goes UP above level
+            sl_hit = price >= level
+
+        return sl_hit, price
+
+    # ---- candle-close SL (direction is encoded by ca/cb itself) ----
     if cond == "ca":  # candle close ABOVE level
         return (price > level), price
 
@@ -207,6 +228,7 @@ def check_sl(
 
 # PATCH: TP now explicitly uses tp_type (equity/option) via _choose_spot_row,
 # not asset_type, and returns the price used (for better logging).
+
 def check_tp(
     row: Dict[str, Any],
     spot_under: Optional[Dict[str, Any]],
@@ -216,10 +238,14 @@ def check_tp(
     Returns (tp_hit, price_used)
 
     TP is always based on spot (last) price of tp_type instrument.
-    No candle-close logic, no tp_cond required.
 
-    Long:  hit when price >= tp_level
-    Short: hit when price <= tp_level
+    Direction logic:
+      - For options:
+          cp = 'c' (call) -> profit when price goes UP  -> hit when price >= tp_level
+          cp = 'p' (put)  -> profit when price goes DOWN -> hit when price <= tp_level
+      - For non-options or missing cp:
+          side = 'long'  -> profit when price goes UP  -> hit when price >= tp_level
+          side = 'short' -> profit when price goes DOWN -> hit when price <= tp_level
     """
 
     enabled = row.get("tp_enabled")
@@ -230,8 +256,24 @@ def check_tp(
     if level is None:
         return False, None
 
-    is_long = row.get("side") == "long"
+    asset_type = (row.get("asset_type") or "").lower()
+    cp = (row.get("cp") or "").lower()
+    side = (row.get("side") or "").lower()
     tp_type = (row.get("tp_type") or "equity").lower()
+
+    # Decide whether profit is when price moves UP or DOWN.
+    # For options we prefer cp; otherwise fall back to side.
+    if asset_type == "option":
+        if cp in ("c", "call"):
+            profit_when_up = True
+        elif cp in ("p", "put"):
+            profit_when_up = False
+        else:
+            # Unknown cp; fall back to side
+            profit_when_up = (side != "short")
+    else:
+        # Non-option: use side if available (default to long)
+        profit_when_up = (side != "short")
 
     # choose equity vs option for TP
     spot_row = _choose_spot_row(row, tp_type, spot_under, spot_option)
@@ -243,13 +285,12 @@ def check_tp(
     if price is None:
         return False, None
 
-    if is_long and price >= level:
-        return True, price
-    if (not is_long) and price <= level:
-        return True, price
+    if profit_when_up:
+        tp_hit = price >= level
+    else:
+        tp_hit = price <= level
 
-    return False, price
-
+    return tp_hit, price
 
 # ---------- MAIN LOOP ----------
 
