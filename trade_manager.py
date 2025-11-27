@@ -60,53 +60,62 @@ def _now_iso() -> str:
 
 # ---------- ENTRY / SL / TP CHECKS ----------
 
-
-def check_entry(row: Dict[str, Any],
-                spot_under: Optional[Dict[str, Any]],
-                spot_option: Optional[Dict[str, Any]]) -> Tuple[bool, Optional[float]]:
+def check_entry(
+    row: Dict[str, Any],
+    spot_under: Optional[Dict[str, Any]],
+    spot_option: Optional[Dict[str, Any]],
+) -> Tuple[bool, Optional[float]]:
     """
     Returns (should_enter, entry_price_used)
+
+    entry_cond:
+      - 'now' -> use spot price of entry_type instrument
+      - 'ca'  -> candle close ABOVE entry_level (for the entry_type instrument)
+      - 'cb'  -> candle close BELOW entry_level (for the entry_type instrument)
     """
-    enabled = row.get("entry_enabled")
-    if not enabled:
+
+    cond = row.get("entry_cond")
+    level = row.get("entry_level")
+    entry_type = row.get("entry_type") or "equity"
+    entry_tf = row.get("entry_tf")
+
+    # Pick which instrument we’re using for entry (equity vs option)
+    spot_row = _choose_spot_row(row, entry_type, spot_under, spot_option)
+    if not spot_row:
         return False, None
 
-    cond = (row.get("entry_cond") or "").lower()
-    if not cond:
-        return False, None
-
-    is_long = row.get("side") == "long"
-
-    price = _get_entry_price(row, spot_under, spot_option)
-    if price is None:
-        return False, None
-
-    entry = row.get("entry")
-    if entry is None:
-        return False, None
-
-    # Condition: "touch" -> for long: price <= entry, for short: price >= entry
-    if cond == "touch":
-        if is_long and price <= entry:
-            return True, price
-        if (not is_long) and price >= entry:
-            return True, price
-        return False, None
-
-    # Condition: "candle-close" -> check close based on tf
-    if cond == "candle-close":
-        # we re-use entry_price logic
-        if is_long and price <= entry:
-            return True, price
-        if (not is_long) and price >= entry:
-            return True, price
-        return False, None
-
-    # "now" -> enter immediately based on current price
+    # -------- NOW: tick-based entry on spot price --------
     if cond == "now":
+        price = _get_spot_price(spot_row)
+        # If we have a price, we always return it for logging, even if we don't enter
+        if price is None:
+            return False, None
         return True, price
 
+    # -------- CA / CB: candle-based entry on TF close --------
+    if cond in ("ca", "cb"):
+        if entry_tf is None:
+            return False, None
+
+        price = _get_tf_close(spot_row, entry_tf)
+
+        # Always return the price used for the decision (if any), so logs can see it
+        if price is None or level is None:
+            return False, price
+
+        # ca = close ABOVE the level
+        if cond == "ca":
+            should_enter = price > level
+            return should_enter, price
+
+        # cb = close BELOW the level
+        if cond == "cb":
+            should_enter = price < level
+            return should_enter, price
+
+    # Unknown / unsupported condition
     return False, None
+
 
 
 def check_sl(row: Dict[str, Any],
